@@ -12,8 +12,6 @@ sdf_feature_dim: [4, 4, 4, 4]
 rgb_feature_dim: [0, 6, 0, 0]
 optimise_poses: true
 decoder:
-    num_prop_samples: 128
-    num_nerf_samples: 32
     geometry:
         W: 32
         D: 2

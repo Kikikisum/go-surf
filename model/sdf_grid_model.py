@@ -17,7 +17,7 @@ class SDFGridModel(torch.nn.Module):
         super(SDFGridModel, self).__init__()
         self.device = device
         # Simple decoder
-        # 计算世界坐标维度、体积原点、体素维度
+        
         world_dims, volume_origin, voxel_dims = compute_world_dims(bounds,
                                                                    config["voxel_sizes"],
                                                                    len(config["voxel_sizes"]),
@@ -84,7 +84,6 @@ class SDFGridModel(torch.nn.Module):
         return ret
 
 
-# 分块处理数据集
 def batchify(fn, max_chunk=1024*128):
     if max_chunk is None:
         return fn
@@ -96,12 +95,12 @@ def batchify(fn, max_chunk=1024*128):
 
 def render_rays(sdf_decoder,
                 rgb_decoder,
-                feat_volume,  # 规范化的特征体积 [1, feat_dim, Nx, Ny, Nz]
-                volume_origin,  # 体积的起点，欧几里得坐标 [3,]
-                volume_dim,  # 体积的维度，欧几里得坐标 [3,]
-                voxel_sizes,  # 体素边长，欧几里得距离
-                rays_o,  # 光线起点
-                rays_d,  # 光线方向
+                feat_volume,  # regualized feature volume [1, feat_dim, Nx, Ny, Nz]
+                volume_origin,  # volume origin, Euclidean coords [3,]
+                volume_dim,  # volume dimensions, Euclidean coords [3,]
+                voxel_sizes,  # length of the voxel side, Euclidean distance
+                rays_o,
+                rays_d,
                 truncation=0.10,
                 near=0.01,
                 far=3.0,
@@ -120,56 +119,48 @@ def render_rays(sdf_decoder,
                 iter=0,
                 rgb_feature_dim=[],
                 ):
-    # 初始化采样点
+
     n_rays = rays_o.shape[0]
-    z_vals = torch.linspace(near, far, n_samples).to(rays_o)  # [n_samples] 从near到far线性采样
+    z_vals = torch.linspace(near, far, n_samples).to(rays_o)
     z_vals = z_vals[None, :].repeat(n_rays, 1)  # [n_rays, n_samples]
     sample_dist = (far - near) / n_samples
-
-    # 随机化采样点位置
+    
     if randomize_samples:
         z_vals += torch.rand_like(z_vals) * sample_dist
-
-    # 逐步进行重要性采样
+        
     n_importance_steps = n_importance // 12
     with torch.no_grad():
         for step in range(n_importance_steps):
-            # 计算查询点
-            query_points = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]  # [n_rays, n_samples, 3]
-            sdf, *_ = qp_to_sdf(query_points, volume_origin, volume_dim, feat_volume, sdf_decoder,
-                                concat_qp=concat_qp_to_sdf, rgb_feature_dim=rgb_feature_dim)
-
-            # 计算每个采样点的SDF值及其间的差异
+            query_points = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]  # n_rays, n_samples, 3
+            sdf, *_ = qp_to_sdf(query_points, volume_origin, volume_dim, feat_volume, sdf_decoder, concat_qp=concat_qp_to_sdf, rgb_feature_dim=rgb_feature_dim)
+            
             prev_sdf, next_sdf = sdf[:, :-1], sdf[:, 1:]
             prev_z_vals, next_z_vals = z_vals[:, :-1], z_vals[:, 1:]
             mid_sdf = (prev_sdf + next_sdf) * 0.5
             cos_val = (next_sdf - prev_sdf) / (next_z_vals - prev_z_vals + 1e-5)
 
-            # 计算前后SDF值的余弦值并取最小值
             prev_cos_val = torch.cat([torch.zeros([n_rays, 1], device=z_vals.device), cos_val[:, :-1]], dim=-1)
             cos_val = torch.stack([prev_cos_val, cos_val], dim=-1)
             cos_val, _ = torch.min(cos_val, dim=-1, keepdim=False)
             cos_val = cos_val.clip(-1e3, 0.0)
-
-            # 计算权重和重采样点
+            
             dists = next_z_vals - prev_z_vals
             weights = neus_weights(mid_sdf, dists, torch.tensor(64. * 2 ** step, device=mid_sdf.device), cos_val)
             z_samples = sample_pdf(z_vals, weights, 12, det=True).detach()
             z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], dim=-1), dim=-1)
-
-    # 计算最终的距离、视角方向和查询点
+        
     dists = z_vals[:, 1:] - z_vals[:, :-1]
     dists = torch.cat([dists, torch.ones_like(depth_gt).unsqueeze(-1) * sample_dist], dim=1)
     z_vals_mid = z_vals + dists * 0.5
     view_dirs = F.normalize(rays_d, dim=-1)[:, None, :].repeat(1, n_samples + n_importance, 1)
     query_points = rays_o[:, None, :] + rays_d[:, None, :] * z_vals_mid[..., :, None]
     query_points = query_points.requires_grad_(True)
-    sdf, rgb_feat, world_bound_mask = qp_to_sdf(query_points, volume_origin, volume_dim, feat_volume, sdf_decoder,
-                                                concat_qp=concat_qp_to_sdf, rgb_feature_dim=rgb_feature_dim)
+    sdf, rgb_feat, world_bound_mask = qp_to_sdf(query_points, volume_origin, volume_dim, feat_volume,
+                                                sdf_decoder, concat_qp=concat_qp_to_sdf, rgb_feature_dim=rgb_feature_dim)
     grads = compute_grads(sdf, query_points)
-
-    # 组合RGB特征
+    
     rgb_feat = [rgb_feat]
+    
     if use_view_dirs:
         rgb_feat.append(view_dirs)
     if use_normals:
@@ -178,80 +169,87 @@ def render_rays(sdf_decoder,
         rgb_feat.append(2. * (query_points - volume_origin) / volume_dim - 1.)
     if concat_dot_prod_to_rgb:
         rgb_feat.append((view_dirs * grads).sum(dim=-1, keepdim=True))
-
-    # 计算RGB值
+    
     rgb = torch.sigmoid(rgb_decoder(torch.cat(rgb_feat, dim=-1)))
-
-    # 计算余弦值和权重
+    
     cos_val = (view_dirs * grads).sum(-1)
+    # cos_val = -F.relu(-cos_val)
     cos_anneal_ratio = min(iter / 5000., 1.)
-    cos_val = -(F.relu(-cos_val * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) + F.relu(-cos_val) * cos_anneal_ratio)
+    cos_val = -(F.relu(-cos_val * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
+                F.relu(-cos_val) * cos_anneal_ratio)
     weights = neus_weights(sdf, dists, inv_s, cos_val)
     weights[~world_bound_mask] = 0.
-
-    # 渲染RGB和深度
+    
     rendered_rgb = torch.sum(weights[..., None] * rgb, dim=-2)
     rendered_depth = torch.sum(weights * z_vals_mid, dim=-1)
+    # depth_var = torch.sum(weights * torch.square(z_vals_mid - rendered_depth.unsqueeze(-1)), dim=-1)
 
-    # 计算Eikonal损失
-    eikonal_weights = sdf[world_bound_mask].detach().abs() + 1e-2
-    eikonal_loss = (torch.square(
-        grads.norm(dim=-1)[world_bound_mask] - 1.) * eikonal_weights).sum() / eikonal_weights.sum()
+    eikonal_weights = sdf[world_bound_mask].detach().abs() + 1e-2 # torch.abs(z_vals - depth_gt.unsqueeze(-1))[world_bound_mask] > truncation
+    eikonal_loss = (torch.square(grads.norm(dim=-1)[world_bound_mask] - 1.) * eikonal_weights).sum() / eikonal_weights.sum()
     eikonal_loss = eikonal_loss.mean()
 
-    # 计算SDF损失
     if depth_gt is not None:
         fs_loss, sdf_loss = get_sdf_loss(z_vals_mid, depth_gt[:, None], sdf, truncation)
     else:
         fs_loss, sdf_loss = torch.tensor(0.0, device=rays_o.device), torch.tensor(0.0, device=rays_o.device)
-
-    # 计算法线正则化损失
+        
     normal_regularisation_loss = torch.tensor(0., device=z_vals.device)
     if smoothness_std > 0:
-        coords = coordinates([feat_volume.volumes[1].shape[2] - 1, feat_volume.volumes[1].shape[3] - 1,
-                              feat_volume.volumes[1].shape[4] - 1], z_vals.device).float().t()
+        coords = coordinates([feat_volume.volumes[1].shape[2] - 1, feat_volume.volumes[1].shape[3] - 1, feat_volume.volumes[1].shape[4] - 1], z_vals.device).float().t()
         world = ((coords + torch.rand_like(coords)) * voxel_sizes[1] + volume_origin).unsqueeze(0)
         surf = rays_o + rays_d * rendered_depth.unsqueeze(-1)
         surf_mask = ((surf > volume_origin) & (surf < (volume_origin + volume_dim))).all(dim=-1)
-        surf = surf[surf_mask, :].unsqueeze(0)
-        weight = torch.cat(
-            [torch.ones(world.shape[:-1], device=world.device) * 0.1, torch.ones(surf.shape[:-1], device=surf.device)],
-            dim=1)
+        surf = surf[surf_mask,:].unsqueeze(0)
+        weight = torch.cat([torch.ones(world.shape[:-1], device=world.device) * 0.1, torch.ones(surf.shape[:-1], device=surf.device)], dim=1)
         world = torch.cat([world, surf], dim=1)
-
+        
         query_points = world.requires_grad_(True)
-        sdf, *_ = qp_to_sdf(query_points, volume_origin, volume_dim, feat_volume, sdf_decoder,
-                            concat_qp=concat_qp_to_sdf, rgb_feature_dim=rgb_feature_dim)
+        sdf, *_ = qp_to_sdf(query_points, volume_origin, volume_dim, feat_volume, sdf_decoder, concat_qp=concat_qp_to_sdf, rgb_feature_dim=rgb_feature_dim)
         mask = sdf.abs() < truncation
-
+        
         if mask.any().item():
             grads = compute_grads(sdf, query_points)[mask]
-
-            # 在法线方向的单位圆内采样点
+            
+            # Sample points inside unit circle orthogonal to gradient direction
             n = F.normalize(grads, dim=-1)
-            u = F.normalize(n[..., [1, 0, 2]] * torch.tensor([1., -1., 0.], device=n.device), dim=-1)
+            u = F.normalize(n[...,[1,0,2]] * torch.tensor([1., -1., 0.], device=n.device), dim=-1)
             v = torch.cross(n, u, dim=-1)
             phi = torch.rand(list(grads.shape[:-1]) + [1], device=grads.device) * 2. * np.pi
             w = torch.cos(phi) * u + torch.sin(phi) * v
-
+            
             world2 = world[mask] + w * smoothness_std
             query_points = world2.requires_grad_(True)
-            sdf, *_ = qp_to_sdf(query_points, volume_origin, volume_dim, feat_volume, sdf_decoder,
-                                concat_qp=concat_qp_to_sdf, rgb_feature_dim=rgb_feature_dim)
+            sdf, *_ = qp_to_sdf(query_points, volume_origin, volume_dim, feat_volume, sdf_decoder, concat_qp=concat_qp_to_sdf, rgb_feature_dim=rgb_feature_dim)
             grads2 = compute_grads(sdf, query_points)
-
+            
             normal_regularisation_loss = ((grads - grads2).norm(dim=-1) * weight[mask]).sum() / weight[mask].sum()
-            normal_regularisation_loss = normal_regularisation_loss.mean()
+    
+    normal_supervision_loss = torch.tensor(0., device=z_vals.device)
+    if normals_gt is not None:
+        depth_mask = (depth_gt > 0.) & (normals_gt != 0.).any(dim=-1)
+        query_points = rays_o[depth_mask] + rays_d[depth_mask] * depth_gt[depth_mask, None]
+        query_points = query_points.requires_grad_(True)
+        sdf, *_ = qp_to_sdf(query_points, volume_origin, volume_dim, feat_volume, sdf_decoder, concat_qp=concat_qp_to_sdf, rgb_feature_dim=rgb_feature_dim)
+        normals = compute_grads(sdf, query_points)
+        normal_supervision_loss = F.mse_loss(normals, normals_gt[depth_mask])
 
-    # 返回渲染结果
-    return rendered_rgb, rendered_depth, weights.sum(
-        1), fs_loss, sdf_loss, eikonal_loss, normal_regularisation_loss, cos_val, weights
+    ret = {"rgb": rendered_rgb,
+           "depth": rendered_depth,
+           "sdf_loss": sdf_loss,
+           "fs_loss": fs_loss,
+           "sdfs": sdf,
+           "weights": weights,
+           "normal_regularisation_loss": normal_regularisation_loss,
+           "eikonal_loss": eikonal_loss,
+           "normal_supervision_loss": normal_supervision_loss,
+           }
+
+    return ret
 
 
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.])).to(x)
 
 
-# 计算
 def qp_to_sdf(pts, volume_origin, volume_dim, feat_volume, sdf_decoder, sdf_act=nn.Identity(), concat_qp=False, rgb_feature_dim=[]):
     # Normalize point cooridnates and mask out out-of-bounds points
     pts_norm = 2. * (pts - volume_origin[None, None, :]) / volume_dim[None, None, :] - 1.
@@ -281,7 +279,7 @@ def qp_to_sdf(pts, volume_origin, volume_dim, feat_volume, sdf_decoder, sdf_act=
     return sdf, rgb_feats_unmasked, mask
 
 
-def neus_weights(sdf, dists, inv_s, cos_val, z_vals=None):
+def neus_weights(sdf, dists, inv_s, cos_val, z_vals=None):    
     estimated_next_sdf = sdf + cos_val * dists * 0.5
     estimated_prev_sdf = sdf - cos_val * dists * 0.5
     
