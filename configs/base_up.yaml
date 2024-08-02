@@ -11,20 +11,39 @@ truncation: 0.16
 sdf_feature_dim: [4, 4, 4, 4]
 rgb_feature_dim: [0, 6, 0, 0]
 optimise_poses: true
+num_levels: 2
+single_mlp: false
+num_prop_samples : 128
+num_nerf_samples : 32
 decoder:
-    num_prop_samples: 128
-    num_nerf_samples: 32
+    PropMLP:
+        W: 256
+        D: 4
+        skips: [ ]
+        n_freq: -1
+        weight_norm: false
+        concat_qp: false
+    NerfMLP:
+        W: 256
+        D: 8
+        skips: [ ]
+        use_view_dirs: true # concatenate viewing direction
+        use_normals: false # concatenate surface normal
+        use_dot_prod: false # concatenate dot product between viewing dir and surface normal
+        n_freq: -1
+        weight_norm: false
+        concat_qp: false
     geometry:
         W: 32
         D: 2
-        skips: []
+        skips: [ ]
         n_freq: -1
         weight_norm: false
         concat_qp: false
     radiance:
         W: 32
         D: 2
-        skips: []
+        skips: [ ]
         use_view_dirs: true # concatenate viewing direction
         use_normals: false # concatenate surface normal
         use_dot_prod: false # concatenate dot product between viewing dir and surface normal

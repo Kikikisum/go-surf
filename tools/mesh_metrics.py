@@ -37,7 +37,7 @@ def compute_metrics(path_pred, path_target):
     area_tgt = int(mesh_target.area * 1e4)
     print("pred: {}, target: {}".format(area_pred, area_tgt))
 
-    # iou, v_gt, v_pred = compute_iou(mesh_pred, mesh_target)
+    iou, v_gt, v_pred = compute_iou(mesh_pred, mesh_target)
 
     pointcloud_pred, idx = mesh_pred.sample(area_pred, return_index=True)
     pointcloud_pred = pointcloud_pred.astype(np.float32)
@@ -95,7 +95,8 @@ def compute_metrics(path_pred, path_target):
         "Comp": completeness,
         "C-L1": chamferL1,
         "NC": normals_correctness,
-        "F-score": F[0]
+        "F-score": F[0],
+        "IoU": iou
     }
 
     return rst
